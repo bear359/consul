@@ -817,6 +817,118 @@ func (s *Store) serviceDiscoveryChainTxn(
 	return index, chain, nil
 }
 
+func (s *Store) ReadResolvedServiceConfigEntries(
+	ws memdb.WatchSet,
+	serviceName string,
+	entMeta *structs.EnterpriseMeta,
+	upstreamIDs []structs.ServiceID,
+	proxyMode structs.ProxyMode,
+) (*ServiceConfigResponseTHREE, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	var res ServiceConfigResponseTHREE
+
+	// The caller will likely calculate this again, but we need to do it here
+	// to determine if we are going to traverse into implicit upstream
+	// definitions.
+	var inferredProxyMode structs.ProxyMode
+
+	index, proxyEntry, err := configEntryTxn(tx, ws, structs.ProxyDefaults, structs.ProxyConfigGlobal, entMeta)
+	if err != nil {
+		return nil, err
+	}
+	res.AcceptMaxIndex(index)
+
+	var proxyConf *structs.ProxyConfigEntry
+	if proxyEntry != nil {
+		var ok bool
+		proxyConf, ok = proxyEntry.(*structs.ProxyConfigEntry)
+		if !ok {
+			return nil, fmt.Errorf("invalid proxy config type %T", proxyEntry)
+		}
+
+		inferredProxyMode = proxyConf.Mode
+	}
+	res.AcceptProxyDefaults(entMeta, proxyConf)
+
+	index, serviceEntry, err := configEntryTxn(tx, ws, structs.ServiceDefaults, serviceName, entMeta)
+	if err != nil {
+		return nil, err
+	}
+	res.AcceptMaxIndex(index)
+
+	var serviceConf *structs.ServiceConfigEntry
+	if serviceEntry != nil {
+		var ok bool
+		serviceConf, ok = serviceEntry.(*structs.ServiceConfigEntry)
+		if !ok {
+			return nil, fmt.Errorf("invalid service config type %T", serviceEntry)
+		}
+
+		if serviceConf.Mode != structs.ProxyModeDefault {
+			inferredProxyMode = serviceConf.Mode
+		}
+	}
+	res.AcceptServiceDefaults(serviceName, entMeta, serviceConf)
+
+	var (
+		noUpstreamArgs = len(upstreamIDs) == 0
+
+		// Check the args and the resolved value. If it was exclusively set via a config entry, then args.Mode
+		// will never be transparent because the service config request does not use the resolved value.
+		tproxy = proxyMode == structs.ProxyModeTransparent || inferredProxyMode == structs.ProxyModeTransparent
+	)
+
+	// The upstreams passed as arguments to this endpoint are the upstreams explicitly defined in a proxy registration.
+	// If no upstreams were passed, then we should only returned the resolved config if the proxy in transparent mode.
+	// Otherwise we would return a resolved upstream config to a proxy with no configured upstreams.
+	if noUpstreamArgs && !tproxy {
+		return &res, nil
+	}
+
+	// First collect all upstreams into a set of seen upstreams.
+	// Upstreams can come from:
+	// - Explicitly from proxy registrations, and therefore as an argument to this RPC endpoint
+	// - Implicitly from centralized upstream config in service-defaults
+	seenUpstreams := map[structs.ServiceID]struct{}{}
+
+	for _, sid := range upstreamIDs {
+		if _, ok := seenUpstreams[sid]; !ok {
+			seenUpstreams[sid] = struct{}{}
+		}
+	}
+
+	if serviceConf != nil && serviceConf.UpstreamConfig != nil {
+		for _, override := range serviceConf.UpstreamConfig.Overrides {
+			if override.Name == "" {
+				continue // skip this impossible condition
+			}
+			seenUpstreams[override.ServiceID()] = struct{}{}
+		}
+	}
+
+	for upstream := range seenUpstreams {
+		index, rawEntry, err := configEntryTxn(tx, ws, structs.ServiceDefaults, upstream.ID, &upstream.EnterpriseMeta)
+		if err != nil {
+			return nil, err
+		}
+		res.AcceptMaxIndex(index)
+
+		var entry *structs.ServiceConfigEntry
+		if rawEntry != nil {
+			var ok bool
+			entry, ok = rawEntry.(*structs.ServiceConfigEntry)
+			if !ok {
+				return nil, fmt.Errorf("invalid service config type %T", rawEntry)
+			}
+		}
+		res.AcceptServiceDefaults(upstream.ID, &upstream.EnterpriseMeta, entry)
+	}
+
+	return &res, nil
+}
+
 // ReadDiscoveryChainConfigEntries will query for the full discovery chain for
 // the provided service name. All relevant config entries will be recursively
 // fetched and included in the result.

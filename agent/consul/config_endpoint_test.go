@@ -2027,6 +2027,100 @@ func TestConfigEntry_ResolveServiceConfig_ProxyDefaultsProtocol_UsedForAllUpstre
 	require.Equal(t, expected, out)
 }
 
+func TestConfigEntry_ResolveServiceConfig_BlockOnNoChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	_, s1 := testServerWithConfig(t)
+	codec := rpcClient(t, s1)
+
+	{ // create one unrelated entry
+		var out bool
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "ConfigEntry.Apply", &structs.ConfigEntryRequest{
+			Entry: &structs.ServiceConfigEntry{
+				Kind: structs.ServiceDefaults,
+				Name: "unrelated",
+			},
+		}, &out))
+		require.True(t, out)
+	}
+
+	{ // create one relevant entry
+		var out bool
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "ConfigEntry.Apply", &structs.ConfigEntryRequest{
+			Entry: &structs.ServiceConfigEntry{
+				Kind:     structs.ServiceDefaults,
+				Name:     "bar",
+				Protocol: "grpc",
+			},
+		}, &out))
+		require.True(t, out)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var count int
+
+	readerCodec := rpcClient(t, s1)
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		args := structs.ServiceConfigRequest{
+			Name: "foo",
+			// Upstreams: []string{"bar"},
+			UpstreamIDs: []structs.ServiceID{
+				structs.NewServiceID("bar", nil),
+			},
+		}
+		args.QueryOptions.MaxQueryTime = time.Second
+
+		for ctx.Err() == nil {
+			var out structs.ServiceConfigResponse
+
+			err := msgpackrpc.CallWithCodec(readerCodec, "ConfigEntry.ResolveServiceConfig", &args, &out)
+			if err != nil {
+				return err
+			}
+			t.Log("blocking query index", out.QueryMeta.Index, out)
+			count++
+			args.QueryOptions.MinQueryIndex = out.QueryMeta.Index
+		}
+		return nil
+
+	})
+
+	writerCodec := rpcClient(t, s1)
+	g.Go(func() error {
+		for i := uint64(0); i < 200; i++ {
+			time.Sleep(5 * time.Millisecond)
+
+			var out bool
+			err := msgpackrpc.CallWithCodec(writerCodec, "ConfigEntry.Apply", &structs.ConfigEntryRequest{
+				Entry: &structs.ServiceConfigEntry{
+					Kind: structs.ServiceDefaults,
+					Name: fmt.Sprintf("other%d", i),
+				},
+			}, &out)
+			if err != nil {
+				return fmt.Errorf("[%d] unexpected error: %w", i, err)
+			}
+			if !out {
+				return fmt.Errorf("[%d] unexpectedly returned false", i)
+			}
+		}
+		cancel()
+		return nil
+	})
+
+	require.NoError(t, g.Wait())
+	// The test is a bit racy because of the timing of the two goroutines, so
+	// we relax the check for the count to be within a small range.
+	if count < 2 || count > 3 {
+		t.Fatalf("expected count to be 2 or 3, got %d", count)
+	}
+}
+
 func TestConfigEntry_ResolveServiceConfigNoConfig(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
